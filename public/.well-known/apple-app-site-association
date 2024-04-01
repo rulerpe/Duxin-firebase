@@ -1,0 +1,27 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "53333MMC4U.com.neetisthebest.Duxin"
+        ],
+        "components": [
+          {
+            "/": "*",
+            "comment": "Matches all routes"
+          }
+        ]
+      }
+    ]
+  },
+  "activitycontinuation": {
+    "apps": [
+      "53333MMC4U.com.neetisthebest.Duxin"
+    ]
+  },
+  "webcredentials": {
+    "apps": [
+      "53333MMC4U.com.neetisthebest.Duxin"
+    ]
+  }
+}
