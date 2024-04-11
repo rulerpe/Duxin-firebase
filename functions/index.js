@@ -10,13 +10,6 @@ const anthropic = new Anthropic({
 const languageCodeRef = require("./languageCodeRef.json");
 const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
 
-const vision = require('@google-cloud/vision');
-const translate = require('@google-cloud/translate').v2;
-const { createCanvas, loadImage } = require('canvas');
-
-const visionClient = new vision.ImageAnnotatorClient();
-const translateClient = new translate.Translate();
-
 admin.initializeApp();
 const bucketName = "duxin-app.appspot.com";
 
@@ -168,149 +161,283 @@ exports.cleanupUserData = functions.auth.user().onDelete(async (user) => {
   }
 });
 
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { logger } = require("firebase-functions");
 
-function wrapText(ctx, text, maxWidth) {
-  const words = [];
-  let line = '';
-  let lines = [];
+// The es6-promise-pool to limit the concurrency of promises.
+const PromisePool = require("es6-promise-pool").default;
+// Maximum concurrent account deletions.
+const MAX_CONCURRENT = 3;
 
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i]
-    const testLine = line + char;
-    const metrics = ctx.measureText(testLine);
-    const testWidth = metrics.width;
+// Run once a day at midnight, to clean up the users
+// Manually run the task here https://console.cloud.google.com/cloudscheduler
+exports.accountcleanup = onSchedule("every day 00:00", async (event) => {
+  // Fetch all user details.
+  const inactiveUsers = await getInactiveUsers();
 
-    if (testWidth > maxWidth && i > 0) {
-      lines.push(line);
-      line = char;
-    } else {
-      line = testLine;
-    }
+  // Use a pool so that we delete maximum `MAX_CONCURRENT` users in parallel.
+  const promisePool = new PromisePool(
+    () => deleteInactiveUser(inactiveUsers),
+    MAX_CONCURRENT
+  );
+  await promisePool.start();
+
+  logger.log("User cleanup finished");
+});
+
+/**
+ * Deletes one inactive user from the list.
+ * @param {admin.auth.UserRecord[]} inactiveUsers
+ * @return {null | Promise<void>}
+ */
+function deleteInactiveUser(inactiveUsers) {
+  if (inactiveUsers.length > 0) {
+    const userToDelete = inactiveUsers.pop();
+
+    // Delete the inactive user.
+    return admin
+      .auth()
+      .deleteUser(userToDelete.uid)
+      .then(() => {
+        return logger.log(
+          "Deleted user account",
+          userToDelete.uid,
+          "because of inactivity"
+        );
+      })
+      .catch((error) => {
+        return logger.error(
+          "Deletion of inactive user account",
+          userToDelete.uid,
+          "failed:",
+          error
+        );
+      });
+  } else {
+    return null;
   }
-  if (line.length > 0) {
-    lines.push(line);
+}
+// Returns the list of all inactive users.
+/**
+ *
+ * @param {admin.auth.UserRecord[]} [users] the current list of inactive users
+ * @param {string} [nextPageToken]
+ * @return {Promise<admin.auth.UserRecord[]>}
+ */
+async function getInactiveUsers(users = [], nextPageToken) {
+  const result = await admin.auth().listUsers(1000, nextPageToken);
+  // Find anoyomus users that have not signed in in the last 30 days.
+  const inactiveUsers = result.users.filter(
+    (user) =>
+      user.phoneNumber &&
+      Date.parse(
+        user.metadata.lastRefreshTime || user.metadata.lastSignInTime
+      ) <
+        Date.now() - 10 * 24 * 60 * 60 * 1000
+  );
+
+  // Add to the list of previously found inactive users.
+  users = users.concat(inactiveUsers);
+
+  // If there are more users to fetch we fetch them.
+  if (result.pageToken) {
+    return getInactiveUsers(users, result.pageToken);
   }
-  return lines;
+
+  return users;
 }
 
-exports.documentTranslate = onRequest(
+// Transfer summary made with Anonymous account to real user account
+exports.saveUserMeta = onRequest(
   {
-    
     cors: ["http://localhost:8081", /duxinapp\.com$/],
   },
-  async (req, res) =>{
-    const imageName = req.body.data.imageName;
-    const bucket = getStorage().bucket(bucketName);
-    const file = bucket.file(imageName);
-    const [imageBuffer] = await file.download()
-
-    const pargraphArr = []
-    // Perform OCR on the image
-    // visionClient.documentTextDetection
-    const [result] = await visionClient.documentTextDetection(imageBuffer);
-
-    const document = result.fullTextAnnotation
-    for (const page of document.pages){
-      for (const block of page.blocks){
-        for (const pargraph of block.paragraphs){
-          let wordsArr = []
-          let wordBoundingBox = pargraph.words[0].symbols[0].boundingBox
-          let wordHeight = wordBoundingBox.vertices[2].y - wordBoundingBox.vertices[0].y
-          for (const word of pargraph.words){
-            let wordStr = ''
-            for (const symbol of word.symbols){
-              wordStr+=symbol.text
-            }
-            wordsArr.push(wordStr)
-          }
-          let pargraphObj = {
-            text: wordsArr.join(' '),
-            boundingBox: pargraph.boundingBox,
-            wordHeight
-          }
-          pargraphArr.push(pargraphObj)
-        }
-
-      }
-
+  async (req, res) => {
+    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    if (!idToken) {
+      return res.status(403).send("Unauthorized");
     }
+    try {
+      const userMeta = req.body.data.userMeta;
+      const decodedToken = await admin.auth().verifyIdToken(idToken);
+      const uid = decodedToken.uid;
 
-    // res.status(200).send({
-    //   // pageArr: pageArr,
-    //   // blockArr: blockArr,
-    //   pargraphArr: pargraphArr,
-    //   // wordArr: wordArr,
-    //   // symbolArr:symbolArr
-    //   textAnnotations:textAnnotations
-    // })
-    // return
-    // const textBlocks = result.fullTextAnnotation.pages[0].blocks;
-  
-    // Translate the extracted text
-    const pargraphText = pargraphArr.map((pargraph) => pargraph.text).join('\n');
-    
-    const target = 'zh'; // Replace with the desired target language code
-    const [translation] = await translateClient.translate(pargraphText, target);
-    const translatedPargraphs = translation.split('\n'); 
+      const db = getFirestore();
+      await db.collection("users").doc(uid).set(userMeta);
 
-    // Load the original image
-    const image = await loadImage(imageBuffer);
+      if (userMeta.previousAnonymousUID) {
+        const summariesRef = db
+          .collection("summaries")
+          .where("userId", "==", userMeta.previousAnonymousUID);
 
-    // Create a new canvas and draw the original image
-    const canvas = createCanvas(image.width, image.height);
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(image, 0, 0);
+        const snapshots = await summariesRef.get();
 
-    // Replace text blocks on the image
-    const font = '16px Arial';
-    ctx.font = font;
-    pargraphArr.forEach((pargraph, i) => {
-      const translatedText = translatedPargraphs[i];
-      const [x1, y1] = [pargraph.boundingBox.vertices[0].x, pargraph.boundingBox.vertices[0].y];
-      const [x2, y2] = [pargraph.boundingBox.vertices[2].x, pargraph.boundingBox.vertices[2].y];
-      const boxWidth = x2 - x1;
-      const boxHeight = y2 - y1;
-      // const textWidth = ctx.measureText(translatedText).width;
-      // const textHeight = parseInt(font, 10);
-
-      // Adjust font size to fit the text within the bounding box
-      // let fontSize = parseInt(font, 10);
-      ctx.font = `${pargraph.wordHeight}px Arial`;
-      const textHeight = parseInt(font, 10);
-      // let textHeight = fontSize;
-
-      // while (textHeight > boxHeight) {
-      //   fontSize -= 1;
-      //   ctx.font = `${fontSize}px Arial`;
-      //   textHeight = fontSize;
-      // }
-      // Wrap the text to fit within the bounding box
-      const lines = wrapText(ctx, translatedText, boxWidth);
-      console.log('translatedText',translatedText)
-      console.log('lines',lines)
-      ctx.fillStyle = 'white';
-      ctx.fillRect(x1, y1, boxWidth, boxHeight);
-      ctx.fillStyle = 'black';
-
-      let lineY = y1 + textHeight;
-      for (const line of lines) {
-        if (lineY + textHeight > y2) break;
-        ctx.fillText(line, x1, lineY);
-        lineY += textHeight;
+        if (!snapshots.empty) {
+          const batch = db.batch();
+          const promises = [];
+          snapshots.forEach((doc) => {
+            batch.update(doc.ref, { userId: uid });
+          });
+          promises.push(batch.commit());
+          await Promise.all(promises);
+        }
       }
-    });
 
-    // Convert the canvas to a buffer and return it as the response
-    const translatedImageBuffer = canvas.toBuffer('image/jpeg');
-    const uploadImage = async (base64Image, imagePath) => {
-      const imageBuffer = Buffer.from(base64Image, "base64");
-      const bucket = getStorage().bucket(bucketName);
-      await bucket.file(imagePath).save(imageBuffer);
-      return;
-    };
-    await uploadImage(translatedImageBuffer,`translated-${imageName}`)
-    
-    res.status(200).send(translatedImageBuffer);
-    
+      res.status(200).send({ data: { message: "usermeta created" } });
+    } catch (error) {
+      console.error("Server Error:", error);
+      res.status(404).send("ServerError");
+    }
   }
-)
+);
+
+// const { createCanvas, loadImage } = require('canvas');
+
+// const visionClient = new vision.ImageAnnotatorClient();
+// const translateClient = new translate.Translate();
+
+// function wrapText(ctx, text, maxWidth) {
+//   const words = [];
+//   let line = '';
+//   let lines = [];
+
+//   for (let i = 0; i < text.length; i++) {
+//     const char = text[i]
+//     const testLine = line + char;
+//     const metrics = ctx.measureText(testLine);
+//     const testWidth = metrics.width;
+
+//     if (testWidth > maxWidth && i > 0) {
+//       lines.push(line);
+//       line = char;
+//     } else {
+//       line = testLine;
+//     }
+//   }
+//   if (line.length > 0) {
+//     lines.push(line);
+//   }
+//   return lines;
+// }
+
+// exports.documentTranslate = onRequest(
+//   {
+
+//     cors: ["http://localhost:8081", /duxinapp\.com$/],
+//   },
+//   async (req, res) =>{
+//     const imageName = req.body.data.imageName;
+//     const bucket = getStorage().bucket(bucketName);
+//     const file = bucket.file(imageName);
+//     const [imageBuffer] = await file.download()
+
+//     const pargraphArr = []
+//     // Perform OCR on the image
+//     // visionClient.documentTextDetection
+//     const [result] = await visionClient.documentTextDetection(imageBuffer);
+
+//     const document = result.fullTextAnnotation
+//     for (const page of document.pages){
+//       for (const block of page.blocks){
+//         for (const pargraph of block.paragraphs){
+//           let wordsArr = []
+//           let wordBoundingBox = pargraph.words[0].symbols[0].boundingBox
+//           let wordHeight = wordBoundingBox.vertices[2].y - wordBoundingBox.vertices[0].y
+//           for (const word of pargraph.words){
+//             let wordStr = ''
+//             for (const symbol of word.symbols){
+//               wordStr+=symbol.text
+//             }
+//             wordsArr.push(wordStr)
+//           }
+//           let pargraphObj = {
+//             text: wordsArr.join(' '),
+//             boundingBox: pargraph.boundingBox,
+//             wordHeight
+//           }
+//           pargraphArr.push(pargraphObj)
+//         }
+
+//       }
+
+//     }
+
+//     // res.status(200).send({
+//     //   // pageArr: pageArr,
+//     //   // blockArr: blockArr,
+//     //   pargraphArr: pargraphArr,
+//     //   // wordArr: wordArr,
+//     //   // symbolArr:symbolArr
+//     //   textAnnotations:textAnnotations
+//     // })
+//     // return
+//     // const textBlocks = result.fullTextAnnotation.pages[0].blocks;
+
+//     // Translate the extracted text
+//     const pargraphText = pargraphArr.map((pargraph) => pargraph.text).join('\n');
+
+//     const target = 'zh'; // Replace with the desired target language code
+//     const [translation] = await translateClient.translate(pargraphText, target);
+//     const translatedPargraphs = translation.split('\n');
+
+//     // Load the original image
+//     const image = await loadImage(imageBuffer);
+
+//     // Create a new canvas and draw the original image
+//     const canvas = createCanvas(image.width, image.height);
+//     const ctx = canvas.getContext('2d');
+//     ctx.drawImage(image, 0, 0);
+
+//     // Replace text blocks on the image
+//     const font = '16px Arial';
+//     ctx.font = font;
+//     pargraphArr.forEach((pargraph, i) => {
+//       const translatedText = translatedPargraphs[i];
+//       const [x1, y1] = [pargraph.boundingBox.vertices[0].x, pargraph.boundingBox.vertices[0].y];
+//       const [x2, y2] = [pargraph.boundingBox.vertices[2].x, pargraph.boundingBox.vertices[2].y];
+//       const boxWidth = x2 - x1;
+//       const boxHeight = y2 - y1;
+//       // const textWidth = ctx.measureText(translatedText).width;
+//       // const textHeight = parseInt(font, 10);
+
+//       // Adjust font size to fit the text within the bounding box
+//       // let fontSize = parseInt(font, 10);
+//       ctx.font = `${pargraph.wordHeight}px Arial`;
+//       const textHeight = parseInt(font, 10);
+//       // let textHeight = fontSize;
+
+//       // while (textHeight > boxHeight) {
+//       //   fontSize -= 1;
+//       //   ctx.font = `${fontSize}px Arial`;
+//       //   textHeight = fontSize;
+//       // }
+//       // Wrap the text to fit within the bounding box
+//       const lines = wrapText(ctx, translatedText, boxWidth);
+//       console.log('translatedText',translatedText)
+//       console.log('lines',lines)
+//       ctx.fillStyle = 'white';
+//       ctx.fillRect(x1, y1, boxWidth, boxHeight);
+//       ctx.fillStyle = 'black';
+
+//       let lineY = y1 + textHeight;
+//       for (const line of lines) {
+//         if (lineY + textHeight > y2) break;
+//         ctx.fillText(line, x1, lineY);
+//         lineY += textHeight;
+//       }
+//     });
+
+//     // Convert the canvas to a buffer and return it as the response
+//     const translatedImageBuffer = canvas.toBuffer('image/jpeg');
+//     const uploadImage = async (base64Image, imagePath) => {
+//       const imageBuffer = Buffer.from(base64Image, "base64");
+//       const bucket = getStorage().bucket(bucketName);
+//       await bucket.file(imagePath).save(imageBuffer);
+//       return;
+//     };
+//     await uploadImage(translatedImageBuffer,`translated-${imageName}`)
+
+//     res.status(200).send(translatedImageBuffer);
+
+//   }
+// )
